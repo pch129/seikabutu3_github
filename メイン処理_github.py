@@ -21,9 +21,8 @@
 こちらはまとまった時間で音楽を聴きたいと思った時に使える機能だと考えます。メリットはユーザーがわざわざ選択しなくても自動で
 気分にあった曲を聴き続蹴ることが期待できる点です。今回は時間が足りず、単純に時系列で特徴量を分析するということで終わって
 しまいました。今後の施策として考えられることは、複数のユーザーのデータをロードして、似た傾向のユーザの曲の選定を基準に
-曲そのものをラベルとしてレコメンドする、似た曲の聴き方をするユーザーを定期的に分類して時系列データによる訓練によって
-学習済みモデルを作り、ファインチューニングをおこなう、深層強化学習やGNNによって楽曲とユーザの関係を学習して長期的に反映する
-ことなどが考えられます。
+曲そのものをラベルとしてレコメンドする、深層強化学習やGNNによって楽曲とユーザの関係を学習して長期的に反映することなどが
+考えらえます。
 '''
 import csv
 import ctypes
@@ -31,14 +30,17 @@ import os
 import pickle
 import threading
 import faiss
+import librosa
 import numpy as np
 import pandas as pd
-import librosa
+import scipy.signal
+import soundfile as sf
 import torch
-import torchaudio
 import torch.nn as nn
 import torch.optim as optim
-from flask import Flask, render_template, request, jsonify
+import whisper
+from flask import Flask
+from flask import request, jsonify, render_template
 from scipy.sparse import csr_matrix, hstack
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
@@ -47,7 +49,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import StandardScaler
 from sudachipy import dictionary
 from sudachipy import tokenizer
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
 app = Flask(__name__)
 
@@ -158,10 +159,8 @@ def index():
 
     return render_template('indexhightext.html')
 
-processor = WhisperProcessor.from_pretrained("openai/whisper-small", language="en", task="transcribe")
-model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small")
-
-# DLLのロード
+# ここから音声認識
+model = whisper.load_model("small.en")
 dll = ctypes.CDLL("./stereophonic_sound_mixed/x64/Debug/stereophonic_sound_mixed.dll")
 
 # DLL関数の引数と返り値の型を指定
@@ -175,36 +174,43 @@ recognized_text = []
 streaming = False
 file_path = ""
 
-def predict_with_transcription(audio_array, sampling_rate):
-    input_features = processor(audio_array, sampling_rate=sampling_rate, return_tensors="pt").input_features
-    predicted_ids = model.generate(input_features, language='en', task='transcribe')
-    transcription = processor.batch_decode(predicted_ids, skip_special_tokens=True)
-    return transcription[0]
-
 def preprocess_audio(audio_array, sampling_rate):
-    # フィルタリング (30Hz - 3000Hz)
-    audio_waveform = torch.from_numpy(audio_array) # NumPy配列をPyTorchテンソルに変換
-    effects = [
-        ["bandpass", "1500", "3000"], # 1500Hzを中心に3000Hzの帯域
-        ["highpass", "30"], # 30Hz以上の高域フィルタ
-    ]
-    filtered_waveform, _ = torchaudio.sox_effects.apply_effects_tensor(audio_waveform.unsqueeze(0), sampling_rate, effects)
-    filtered_waveform = filtered_waveform.squeeze(0).numpy() # PyTorchテンソルをNumPy配列に変換
+    audio_array = np.float32(audio_array)  # データ型をfloat32に変換
+    sos = scipy.signal.butter(10, [30, 3000], btype='bandpass', fs=sampling_rate, output='sos')
+    filtered_waveform = scipy.signal.sosfilt(sos, audio_array)
     return filtered_waveform
+
+def clean_text(text):
+    return ' '.join(text.split())
+
+def remove_duplicates(text_list):
+    return list(dict.fromkeys(text_list))
 
 def process_audio(file_path):
     global recognized_text, streaming
     recognized_text.clear()
     try:
+        # ファイルパスの確認
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"ファイルが存在しません: {file_path}")
+
         audio, sample_rate = librosa.load(file_path, sr=16000, mono=True)
-        audio = preprocess_audio(audio, sample_rate)
-        # 学習済みモデルを使って文字起こし
-        recognized_text.append(predict_with_transcription(audio, sample_rate))
+        audio = preprocess_audio(audio, sample_rate)  # フィルタリングされた音声データを取得
+
+        # 一時ファイルにフィルタリング後のオーディオデータを書き込む
+        temp_file_path = "filtered_temp.wav"
+        sf.write(temp_file_path, audio, sample_rate)
+
+        # Whisperモデルで音声ファイルを処理
+        result = model.transcribe(temp_file_path)
+        text = clean_text(result["text"])
+        recognized_text.extend(remove_duplicates(text.split("\n")))
         print(f"Recognized text: {recognized_text}")
+        os.remove(temp_file_path)
     except Exception as e:
         print(f"音声処理中にエラーが発生しました: {e}")
     finally:
-        streaming = False
+        streaming = False  # 音声処理が終了したらstreamingをFalseに設定
         print("Stream ended. Final recognized text:", recognized_text)
 
 @app.route('/lyrics')
@@ -213,7 +219,11 @@ def lyrics_page():
 
 @app.route('/recognized-text', methods=['GET'])
 def get_recognized_text():
-    return jsonify(recognized_text)
+    global streaming
+    if not streaming:
+        return jsonify(recognized_text)
+    else:
+        return jsonify([])
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -236,7 +246,6 @@ def upload_file():
         except Exception as e:
             return f"DLL呼び出し中にエラーが発生しました: {str(e)}", 500
 
-        # 音声ファイルのアップロード後にプロセスを開始
         threading.Thread(target=process_audio, args=(file_path,)).start()
         return jsonify({"message": "ファイルが正常にアップロードされ、音声認識を開始しました。"})
 
@@ -265,6 +274,7 @@ def clear_lyrics():
     global recognized_text
     recognized_text.clear()
     return jsonify({"message": "歌詞がクリアされました。"})
+
 
 @app.route('/song/<int:song_index>', methods=['GET'])
 # song.htmlのindex→song関数のsong_index→（結果的に）song関数のindex
@@ -380,7 +390,6 @@ def cluster_n(cluster_id):
 class RNNModel(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, num_layers, dropout):
         super(RNNModel, self).__init__()
-        #batch_first = Trueでpermuteいらない
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
         self.fc = nn.Linear(hidden_size, output_size)
         self.dropout = nn.Dropout(dropout)
