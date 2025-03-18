@@ -125,10 +125,10 @@ def index():
     if request.method == 'POST':
         search_word = request.form.get('search_word', None)
         if search_word:
-            # 検索機能のコードをここに追加
+            # 単純な検索
             title_matches = df[df['曲名'] == search_word]
             title_results = [(row['曲名'], row['artist'], row.name, 'dummy_audio.wav', '歌詞') for _, row in title_matches.iterrows()]
-
+            # 歌詞照合検索
             filtered_df = dfc[dfc['Word1'] == search_word]
             top3_rows = filtered_df.nlargest(3, 'Count')
             values_d = top3_rows['Word2'].tolist()
